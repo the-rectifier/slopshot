@@ -673,8 +673,10 @@ impl App {
                     actions.push(Action::Rate(sel, r as u8));
                 }
             }
-            if i.key_pressed(Key::P) { actions.push(Action::Flag(sel, Flag::Picked)) }
-            if i.key_pressed(Key::X) { actions.push(Action::Flag(sel, Flag::Rejected)) }
+            // P/X toggle like the ✔/✖ buttons: pressing again clears the flag.
+            let toggle = |f| if self.photos[sel].mark.flag == f { Flag::None } else { f };
+            if i.key_pressed(Key::P) { actions.push(Action::Flag(sel, toggle(Flag::Picked))) }
+            if i.key_pressed(Key::X) { actions.push(Action::Flag(sel, toggle(Flag::Rejected))) }
             if i.key_pressed(Key::U) { actions.push(Action::Flag(sel, Flag::None)) }
         });
         for a in actions {

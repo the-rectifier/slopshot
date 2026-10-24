@@ -94,7 +94,7 @@ Despite all of the above, it actually does stuff:
 |---|---|
 | `←` `→` `↑` `↓` | Move selection / previous–next photo |
 | `1`–`5` | Rate · `0` clears |
-| `P` / `X` / `U` | Pick / reject / unflag |
+| `P` / `X` / `U` | Pick / reject / unflag · `P`/`X` again clears it |
 | `Enter` / `Space` / double-click | Open large view |
 | `Esc` | Back to grid |
 | `Z` | 100% at the focus point / back to fit |
