@@ -41,11 +41,11 @@
 
 | Question | Answer |
 |---|---|
-| Does it work? | 🔥🐶☕ *"This is fine."* It works on my machine™ (Sony a6400 and a6700, Linux). |
+| Does it work? | 🔥🐶☕ *"This is fine."* It works on my machine™ (Sony a6400 and a6700, Linux) and on someone else's machine™ (Canon EOS RP, Windows 11). |
 | Will you fix my bug? | lol. lmao, even. |
 | Can I open an issue? | You can. I may read it. An AI may fix it. Neither is guaranteed. |
-| PRs welcome? | Sure, but you're reviewing AI slop with more AI slop. Godspeed. |
-| Is the code good? | It has comments. It compiles. It passed the vibe check. |
+| PRs welcome? | Sure, but you're reviewing AI slop with more AI slop. Godspeed. One has been merged so far: an AI wrote it, an AI reviewed it, and it got *better* in review. Nobody involved has a pulse. 🤖🤝🤖 |
+| Is the code good? | It has comments. It compiles. It passed the vibe check. It now also passes the overflow check (ask the cursed 120-byte CR3). |
 | Why is it called slopshot? | Because it's AI slop that shoots (photos). Read the room. |
 | Should I use this for my wedding clients' photos? | Back them up first. Then maybe. Then back them up again. |
 
@@ -60,7 +60,8 @@ Despite all of the above, it actually does stuff:
 ### Culling
 - **Open a folder** of `.ARW` / `.CR3` files (native folder picker, or pass the folder as an argument)
 - **Gallery grid** with thumbnails, filename, capture date and an EXIF summary (`50mm  f/2.8  1/125s  ISO 1000`)
-- **Star ratings** (1–5), **pick** ✔ and **reject** ✖ flags. Rejected shots get dimmed so they stop judging you.
+- **Star ratings** (1–5), **pick** ✔ and **reject** ✖ flags. Rejected shots get dimmed so they stop judging you. `P`/`X` toggle, so hitting one twice is a no-op, not a commitment.
+- **Cull with a filter on**: filter to *Unflagged*, open the large view and start pressing `P`/`X`. A photo that drops out of the filter stays on screen (greyed out in the film strip, in its old slot), and the arrows carry on to its old neighbours instead of teleporting you back to photo #1. Changed your mind? Press the key again and it's back.
 - **Ratings persist** in a small `.slopshot.json` file in the photo folder. Your RAWs are never modified.
 - **In-camera ratings** are imported if you starred shots on the camera
 - **Export** copies every picked file to a folder of your choice, with a progress bar. Existing files are skipped, never overwritten.
@@ -93,7 +94,7 @@ Despite all of the above, it actually does stuff:
 
 | Key | Action |
 |---|---|
-| `←` `→` `↑` `↓` | Move selection / previous–next photo |
+| `←` `→` `↑` `↓` | Move selection / previous–next photo (also from a photo that just left the filter) |
 | `1`–`5` | Rate · `0` clears |
 | `P` / `X` / `U` | Pick / reject / unflag · `P`/`X` again clears it |
 | `Enter` / `Space` / double-click | Open large view |
@@ -111,7 +112,7 @@ Despite all of the above, it actually does stuff:
 
 ## Building
 
-You need a recent Rust toolchain (built with 1.91).
+You need Rust **1.89 or newer** (`rawler` refuses anything older; last built with 1.99.1).
 
 ```sh
 git clone https://github.com/the-rectifier/slopshot.git
@@ -124,6 +125,14 @@ cargo build --release
 On Linux the folder picker goes through the XDG desktop portal (`xdg-desktop-portal` plus a backend for your desktop). Windows works: a contributor ran it on Windows 11, so for once the README was *underselling* itself. macOS *should* work since every dependency is cross-platform. That has never been tested. See disclaimer. 🙃
 
 The first build takes a while because `rawler` is chunky. Go make coffee. ☕
+
+There are tests now, which is a sentence nobody expected to read in this README:
+
+```sh
+cargo test
+```
+
+They cover CR3 box walking, a whole synthetic CR3 end to end, XMP ratings, Canon AF maths, film strip layout, culling with a filter on, and one cursed file that used to crash a worker thread. They were also written by an AI. Obviously.
 
 ---
 
@@ -162,7 +171,7 @@ SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test --release samples -- --ignored --no
 
 ```
   ┌──────────────────────────────────────────────┐
-  │  slopshot: proudly mass-produced by a model  │
-  │  that has never held a camera                │
+  │  slopshot: proudly mass-produced by several  │
+  │  models that have never held a camera        │
   └──────────────────────────────────────────────┘
 ```
