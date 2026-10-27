@@ -1,9 +1,10 @@
+mod cr3;
 mod exposure;
 mod pixels;
 mod raw;
 
 use eframe::egui::{
-    self, pos2, vec2, Align, Color32, ColorImage, Key, Layout, Pos2, Rect, RichText, Sense, Stroke,
+    self, pos2, vec2, Align, Align2, Color32, ColorImage, Key, Layout, Pos2, Rect, RichText, Sense, Stroke,
     TextureHandle, TextureOptions, UiBuilder, Vec2,
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,11 @@ const GAP: f32 = 8.0;
 const GREEN: Color32 = Color32::from_rgb(70, 190, 90);
 const RED: Color32 = Color32::from_rgb(220, 70, 60);
 const GOLD: Color32 = Color32::from_rgb(240, 190, 40);
+/// Film strip under the large view: total height, sprocket band height (top and
+/// bottom), photos shown each side of the current one.
+const STRIP_H: f32 = 92.0;
+const SPROCKET_H: f32 = 14.0;
+const STRIP_SIDE: (usize, usize) = (3, 6);
 
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
@@ -128,7 +134,7 @@ impl Photo {
 fn is_raw(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("arw") || e.eq_ignore_ascii_case("awr"))
+        .is_some_and(|e| ["arw", "awr", "cr3"].iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
 // ---------- background decoding ----------
@@ -226,7 +232,7 @@ fn decode(path: &Path, shrink: u32) -> (Option<image::RgbImage>, Option<raw::Raw
 
 /// Full resolution for zooming; the ~1.6k preview is too small. In order of preference
 /// (fastest, and same look as the preview first): the camera JPG shot alongside,
-/// a full-size JPEG embedded in the ARW (newer bodies), or developing the RAW.
+/// a full-size JPEG embedded in the RAW (newer Sony bodies, every CR3), or developing the RAW.
 fn decode_hires(path: &Path) -> Option<(image::RgbImage, &'static str)> {
     let jpg = sibling_jpg(path);
     let embedded = || {
@@ -378,6 +384,8 @@ enum ZoomCmd {
 
 enum Action {
     Select(usize),
+    /// Select from the film strip, scrolling the grid to it.
+    Jump(usize),
     Open(usize),
     Rate(usize, u8),
     Flag(usize, Flag),
@@ -397,6 +405,10 @@ struct App {
     /// Full decodes queued or in flight.
     full_requested: HashSet<usize>,
     prefetch_for: Vec<usize>,
+    /// Last place the selection was seen in the visible list: (photo, position).
+    /// Lets the film strip and the arrow keys carry on from there after the
+    /// photo drops out of the filter (reject it while filtered to Unflagged).
+    anchor: Option<(usize, usize)>,
     /// Full-resolution image for the photo in the large view: idx, texture, its auto EV, source.
     hires: Option<(usize, Shown, f32, &'static str)>,
     hires_requested: Option<usize>,
@@ -410,6 +422,8 @@ struct App {
     zoom_pct: f32,
     show_info: bool,
     show_focus: bool,
+    /// Film strip of neighbouring photos under the large view.
+    show_strip: bool,
     /// Photo in the large view and when it got there (full res loads after a short dwell).
     viewer_at: Option<(usize, std::time::Instant)>,
     export: Option<Export>,
@@ -448,6 +462,7 @@ impl App {
             full: HashMap::new(),
             full_requested: HashSet::new(),
             prefetch_for: Vec::new(),
+            anchor: None,
             hires: None,
             hires_requested: None,
             hires_failed: HashSet::new(),
@@ -457,6 +472,7 @@ impl App {
             zoom_pct: 0.0,
             show_info: true,
             show_focus: true,
+            show_strip: true,
             viewer_at: None,
             export: None,
             status: String::new(),
@@ -626,6 +642,11 @@ impl App {
     fn apply(&mut self, a: Action) {
         match a {
             Action::Select(i) => self.selected = Some(i),
+            Action::Jump(i) => {
+                // From the film strip: the grid isn't on screen, so bring it along.
+                self.selected = Some(i);
+                self.scroll_to_selected = true;
+            }
             Action::Open(i) => {
                 self.selected = Some(i);
                 self.viewing = true;
@@ -645,7 +666,7 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let pos = self.selected.and_then(|s| vis.iter().position(|&i| i == s));
+        let at = self.selected.and_then(|s| locate(vis, s, self.anchor));
         let mut actions = Vec::new();
         let mut step: isize = 0;
         ctx.input(|i| {
@@ -659,6 +680,7 @@ impl App {
             if i.key_pressed(Key::I) { self.show_info = !self.show_info }
             if i.key_pressed(Key::F) { self.show_focus = !self.show_focus }
             if self.viewing {
+                if i.key_pressed(Key::S) { self.show_strip = !self.show_strip }
                 if i.key_pressed(Key::Z) { self.zoom_cmd = Some(ZoomCmd::Toggle(None)) }
                 if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) { self.zoom_cmd = Some(ZoomCmd::By(1.25, None)) }
                 if i.key_pressed(Key::Minus) { self.zoom_cmd = Some(ZoomCmd::By(0.8, None)) }
@@ -683,11 +705,7 @@ impl App {
             self.apply(a);
         }
         if step != 0 && !vis.is_empty() {
-            let new = match pos {
-                Some(p) => (p as isize + step).clamp(0, vis.len() as isize - 1) as usize,
-                None => 0,
-            };
-            self.selected = Some(vis[new]);
+            self.selected = Some(vis[step_from(at, step, vis.len())]);
             self.scroll_to_selected = true;
         }
     }
@@ -790,7 +808,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("📂 Open folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().set_title("Open folder with ARW files").pick_folder() {
+                    if let Some(dir) = rfd::FileDialog::new().set_title("Open folder with RAW files").pick_folder() {
                         self.open_folder(dir);
                     }
                 }
@@ -927,6 +945,7 @@ impl App {
                      Z  100% at focus point / fit\n\
                      Double-click  100% here / fit\n\
                      F  show focus point\n\
+                     S  film strip\n\
                      Drag  pan",
                 )
                 .small()
@@ -976,7 +995,7 @@ impl App {
         actions
     }
 
-    fn viewer(&mut self, ui: &mut egui::Ui, idx: usize) -> Vec<Action> {
+    fn viewer(&mut self, ui: &mut egui::Ui, idx: usize, vis: &[usize]) -> Vec<Action> {
         let mut actions = Vec::new();
         let ev = self.display_ev(idx);
         if let Thumb::Ready(s) = &mut self.photos[idx].thumb {
@@ -998,6 +1017,20 @@ impl App {
         let (manual, auto, preview_auto) = (self.ev, self.auto_bright, self.photos[idx].auto_ev);
         if let Some((_, s, auto_ev, _)) = &mut self.hires {
             s.set_ev(hires_ev(manual, auto, *auto_ev, preview_auto));
+        }
+
+        // Film strip: the current photo and its neighbours in the grid's order
+        // (filters and sort apply), as many per side as fit, within STRIP_SIDE.
+        let strip = match locate(vis, idx, self.anchor) {
+            Some(at) if self.show_strip => strip_slots(vis, idx, at, ui.available_width()),
+            _ => (Vec::new(), 0.0),
+        };
+        let gone = matches!(locate(vis, idx, self.anchor), Some(At::Gone(_)));
+        for &i in strip.0.iter().flatten() {
+            let ev = self.display_ev(i);
+            if let Thumb::Ready(s) = &mut self.photos[i].thumb {
+                s.set_ev(ev);
+            }
         }
 
         let p = &self.photos[idx];
@@ -1027,6 +1060,7 @@ impl App {
             } else if let Some((_, _, _, source)) = &self.hires {
                 ui.label(RichText::new(format!("full res ({source})")).weak());
             }
+            ui.toggle_value(&mut self.show_strip, "🎞 Strip").on_hover_text("Show neighbouring photos below (S)");
             ui.separator();
             ui.label(RichText::new(format!("display {ev:+.1} EV")).weak());
         });
@@ -1040,7 +1074,17 @@ impl App {
             _ => None,
         });
         let hires_tex = self.hires.as_ref().map(|h| &h.1.tex);
-        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let mut area = ui.available_size();
+        if !strip.0.is_empty() {
+            area.y = (area.y - STRIP_H - 4.0).max(0.0);
+        }
+        let (rect, resp) = ui.allocate_exact_size(area, Sense::click_and_drag());
+        if !strip.0.is_empty() {
+            ui.add_space(4.0);
+            let (strip_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_H), Sense::hover());
+            let strip = Strip { slots: strip.0, frame_w: strip.1, current: idx, gone };
+            film_strip(ui, &self.photos, &strip, strip_rect, &mut actions);
+        }
         let Some(layout_tex) = preview.or(hires_tex) else {
             ui.put(rect, egui::Spinner::new().size(32.0));
             return actions;
@@ -1219,6 +1263,134 @@ fn mark_controls(ui: &mut egui::Ui, p: &Photo, idx: usize, size: f32, actions: &
     actions.extend(flag_btn(ui, Flag::Rejected, "✖", RED, "Reject (X)"));
 }
 
+/// Where a photo is in the visible list.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum At {
+    /// At this position.
+    In(usize),
+    /// Filtered out; it was at this position (its old neighbours now meet there).
+    Gone(usize),
+}
+
+fn locate(vis: &[usize], idx: usize, anchor: Option<(usize, usize)>) -> Option<At> {
+    match vis.iter().position(|&i| i == idx) {
+        Some(p) => Some(At::In(p)),
+        None => anchor.filter(|a| a.0 == idx).map(|a| At::Gone(a.1.min(vis.len()))),
+    }
+}
+
+/// Position in `vis` (of length `len` > 0) after an arrow-key `step`. A photo
+/// that was filtered out has had its neighbours close the gap at its old spot
+/// `p`, so the next photo is the one now at `p` and the previous one is at `p - 1`.
+fn step_from(at: Option<At>, step: isize, len: usize) -> usize {
+    let new = match at {
+        Some(At::In(p)) => p as isize + step,
+        Some(At::Gone(p)) => p as isize + if step > 0 { step - 1 } else { step },
+        None => 0,
+    };
+    new.clamp(0, len as isize - 1) as usize
+}
+
+/// Slots for the film strip: the current photo in the middle and `n` neighbours
+/// per side in `vis` order (`None` past either end, so the current photo stays
+/// centred), plus the frame width. A photo that has just been filtered out keeps
+/// its old slot between its old neighbours. `n` is as many as fit in `width`,
+/// within STRIP_SIDE; at the minimum the frames shrink instead.
+fn strip_slots(vis: &[usize], idx: usize, at: At, width: f32) -> (Vec<Option<usize>>, f32) {
+    let frame_h = STRIP_H - 2.0 * SPROCKET_H - 8.0;
+    let cell = frame_h * 1.5 + GAP;
+    let fit = ((width / cell).floor() as usize).saturating_sub(1) / 2;
+    let n = fit.clamp(STRIP_SIDE.0, STRIP_SIDE.1);
+    let frame_w = ((width - GAP) / (2 * n + 1) as f32 - GAP).min(frame_h * 1.5);
+    let (pos, gap) = match at {
+        At::In(p) => (p, 0),
+        At::Gone(p) => (p, 1), // nothing to skip at `p`: the next photo is already there
+    };
+    let slot = |d: isize| match d {
+        0 => Some(idx),
+        d if d < 0 => pos.checked_add_signed(d).and_then(|p| vis.get(p).copied()),
+        d => vis.get(pos + d as usize - gap).copied(),
+    };
+    ((-(n as isize)..=n as isize).map(slot).collect(), frame_w)
+}
+
+/// A strip of film: dark base, sprocket holes along both edges, and a frame per
+/// slot holding that photo's thumbnail (so it works for any format slopshot can
+/// preview). Clicking a frame moves the large view to it.
+/// What the film strip shows: slots from `strip_slots`, the frame width, the
+/// photo in the large view, and whether it has just been filtered out.
+struct Strip {
+    slots: Vec<Option<usize>>,
+    frame_w: f32,
+    current: usize,
+    gone: bool,
+}
+
+fn film_strip(ui: &egui::Ui, photos: &[Photo], strip: &Strip, rect: Rect, actions: &mut Vec<Action>) {
+    let Strip { ref slots, frame_w, current, gone } = *strip;
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 4.0, Color32::from_gray(14));
+    // Sprocket holes, spaced like 35mm film relative to the strip height.
+    let hole = vec2(8.0, 6.0);
+    let pitch = 16.0;
+    let mut x = rect.left() + pitch / 2.0;
+    while x < rect.right() {
+        for y in [rect.top() + SPROCKET_H / 2.0, rect.bottom() - SPROCKET_H / 2.0] {
+            painter.rect_filled(Rect::from_center_size(pos2(x, y), hole), 1.5, Color32::from_gray(52));
+        }
+        x += pitch;
+    }
+
+    let frame_h = rect.height() - 2.0 * SPROCKET_H - 8.0;
+    let total = slots.len() as f32 * (frame_w + GAP) - GAP;
+    let mut left = rect.center().x - total / 2.0;
+    for (k, slot) in slots.iter().enumerate() {
+        let frame = Rect::from_min_size(pos2(left, rect.top() + SPROCKET_H + 4.0), vec2(frame_w, frame_h));
+        left += frame_w + GAP;
+        painter.rect_filled(frame, 2.0, Color32::from_gray(26));
+        let Some(i) = *slot else { continue };
+        let p = &photos[i];
+        let resp = ui.interact(frame, ui.id().with(("strip", k)), Sense::click()).on_hover_text(&p.name);
+        let pic = match &p.thumb {
+            // Greyed out right down when it has just dropped out of the filter.
+            Thumb::Ready(s) => paint_fit(ui, &s.tex, frame.shrink(2.0), if i == current && gone { Color32::from_gray(60) } else { dim(p) }),
+            Thumb::Pending => {
+                painter.text(frame.center(), Align2::CENTER_CENTER, "…", egui::FontId::proportional(14.0), Color32::GRAY);
+                frame
+            }
+            Thumb::Failed => {
+                painter.text(frame.center(), Align2::CENTER_CENTER, "—", egui::FontId::proportional(14.0), Color32::GRAY);
+                frame
+            }
+        };
+        if p.mark.rating > 0 {
+            let stars = "★".repeat(p.mark.rating as usize);
+            let at = pic.left_bottom() + vec2(3.0, -2.0);
+            for (d, c) in [(vec2(1.0, 1.0), Color32::from_black_alpha(200)), (Vec2::ZERO, GOLD)] {
+                painter.text(at + d, Align2::LEFT_BOTTOM, &stars, egui::FontId::proportional(10.0), c);
+            }
+        }
+        // Flag colour on the frame itself, so the photo being judged shows its
+        // verdict too; the current one also gets the selection ring around it.
+        let flag = match p.mark.flag {
+            Flag::Picked => Some(Stroke::new(2.0_f32, GREEN)),
+            Flag::Rejected => Some(Stroke::new(2.0_f32, RED)),
+            Flag::None if resp.hovered() && i != current => Some(Stroke::new(1.0_f32, Color32::from_gray(160))),
+            Flag::None => None,
+        };
+        if let Some(b) = flag {
+            painter.rect_stroke(frame, 2.0, b, egui::StrokeKind::Inside);
+        }
+        if i == current {
+            let ring = if gone { Color32::from_gray(110) } else { ui.visuals().selection.stroke.color };
+            painter.rect_stroke(frame.expand(1.0), 3.0, Stroke::new(2.0_f32, ring), egui::StrokeKind::Outside);
+        }
+        if resp.clicked() && i != current {
+            actions.push(Action::Jump(i));
+        }
+    }
+}
+
 fn card(ui: &mut egui::Ui, p: &Photo, idx: usize, selected: bool, show_focus: bool, actions: &mut Vec<Action>) {
     let (rect, _) = ui.allocate_exact_size(vec2(CARD_W, CARD_H), Sense::hover());
     let vis = ui.visuals();
@@ -1269,6 +1441,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive(ctx);
         let vis = self.visible();
+        if let Some(sel) = self.selected
+            && let Some(p) = vis.iter().position(|&i| i == sel)
+        {
+            self.anchor = Some((sel, p));
+        }
         self.handle_keys(ctx, &vis);
         self.prefetch(&vis);
         if self.selected.is_none() {
@@ -1291,7 +1468,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.folder.is_none() {
                 ui.centered_and_justified(|ui| {
-                    if ui.button(RichText::new("📂 Open a folder of ARW files…").size(20.0)).clicked() {
+                    if ui.button(RichText::new("📂 Open a folder of ARW/CR3 files…").size(20.0)).clicked() {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             self.open_folder(dir);
                         }
@@ -1300,16 +1477,65 @@ impl eframe::App for App {
                 return;
             }
             if self.photos.is_empty() {
-                ui.centered_and_justified(|ui| ui.label("No .ARW files in this folder."));
+                ui.centered_and_justified(|ui| ui.label("No .ARW or .CR3 files in this folder."));
                 return;
             }
             let actions = match (self.viewing, self.selected) {
-                (true, Some(idx)) => self.viewer(ui, idx),
+                (true, Some(idx)) => self.viewer(ui, idx, &vis),
                 _ => self.grid(ui, &vis),
             };
             for a in actions {
                 self.apply(a);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_neighbour_count() {
+        let vis: Vec<usize> = (0..40).collect();
+        // Narrow: still 3 per side, frames shrink to fit.
+        let (s, w) = strip_slots(&vis, 20, At::In(20), 300.0);
+        assert_eq!(s.len(), 7);
+        assert!(w * 7.0 + GAP * 8.0 <= 300.0 + 0.01);
+        // Wide: capped at 6 per side.
+        let (s, _) = strip_slots(&vis, 20, At::In(20), 4000.0);
+        assert_eq!(s, (14..=26).map(Some).collect::<Vec<_>>());
+        // Medium width picks in between.
+        let (s, _) = strip_slots(&vis, 20, At::In(20), 844.0);
+        assert_eq!(s.len(), 9);
+    }
+
+    #[test]
+    fn strip_follows_visible_order_and_pads_ends() {
+        let vis = vec![7, 3, 9, 1];
+        let (s, _) = strip_slots(&vis, 7, At::In(0), 300.0);
+        assert_eq!(s, vec![None, None, None, Some(7), Some(3), Some(9), Some(1)]);
+    }
+
+    /// The review's culling flow: filter to Unflagged, open the large view, press
+    /// X. Photo 5 leaves `vis`; the strip keeps it in its old slot (between 4 and
+    /// 6) instead of vanishing, and the arrows carry on from there.
+    #[test]
+    fn strip_and_arrows_survive_the_current_photo_being_filtered_out() {
+        let before: Vec<usize> = (0..10).collect();
+        let anchor = Some((5, before.iter().position(|&i| i == 5).unwrap()));
+        let vis: Vec<usize> = before.into_iter().filter(|&i| i != 5).collect();
+        let at = locate(&vis, 5, anchor);
+        assert_eq!(at, Some(At::Gone(5)));
+        let (s, _) = strip_slots(&vis, 5, at.unwrap(), 300.0);
+        assert_eq!(s, [2, 3, 4, 5, 6, 7, 8].map(Some).to_vec());
+        // Right goes to 6, left to 4, not back to the first photo.
+        assert_eq!(vis[step_from(at, 1, vis.len())], 6);
+        assert_eq!(vis[step_from(at, -1, vis.len())], 4);
+        assert_eq!(vis[step_from(at, 3, vis.len())], 8); // a grid row down
+        assert_eq!(step_from(Some(At::In(2)), 1, 9), 3);
+        // A stale anchor for some other photo doesn't apply; at the end, it clamps.
+        assert_eq!(locate(&vis, 5, Some((8, 2))), None);
+        assert_eq!(locate(&[0, 1], 9, Some((9, 7))), Some(At::Gone(2)));
     }
 }

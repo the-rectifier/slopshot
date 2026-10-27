@@ -1,5 +1,7 @@
 //! Minimal TIFF/ARW reader: pulls the embedded JPEG preview, capture date and
 //! orientation out of a Sony ARW without reading (or demosaicing) the whole file.
+//! Canon CR3 files are detected here and handed to `cr3`, which reuses the IFD
+//! walking below for the TIFF blocks it embeds.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -39,14 +41,15 @@ pub struct Exif {
     /// Largest image in the file (the sensor data), before orientation.
     pub width: u32,
     pub height: u32,
-    /// The ARW embeds a full-resolution camera JPEG (a6700 generation and newer).
+    /// The file embeds a full-resolution camera JPEG (a6700 generation and newer, all CR3).
     pub full_jpeg: bool,
-    /// In-camera star rating (Sony MakerNote 0x2002).
+    /// In-camera star rating (Sony MakerNote 0x2002, Canon XMP).
     pub rating: Option<u8>,
     pub focus: Option<Focus>,
 }
 
-/// Where the camera focused, in sensor coordinates (Sony MakerNote 0x2027/0x2037).
+/// Where the camera focused, in sensor coordinates (Sony MakerNote 0x2027/0x2037,
+/// Canon MakerNote AFInfo2).
 #[derive(Clone, Copy)]
 pub struct Focus {
     pub sensor: (f32, f32),
@@ -117,32 +120,58 @@ pub fn trim(v: f32, places: usize) -> String {
 /// adds up on USB drives). The preview JPEG is then a second read.
 const HEAD: usize = 64 << 10;
 
-struct Tiff {
-    f: File,
+/// Byte source plus TIFF byte order. Either a file (with its start cached in
+/// `head`) or, for the TIFF blocks inside a CR3, just an in-memory buffer.
+pub(crate) struct Tiff {
+    f: Option<File>,
     head: Vec<u8>,
     le: bool,
 }
 
 impl Tiff {
-    fn bytes(&mut self, off: u64, len: usize) -> Option<Vec<u8>> {
-        if let Some(b) = self.head.get(off as usize..off as usize + len) {
+    /// An in-memory TIFF; offsets are relative to the start of `buf`.
+    pub(crate) fn mem(buf: Vec<u8>) -> Self {
+        Self { f: None, head: buf, le: true }
+    }
+    pub(crate) fn bytes(&mut self, off: u64, len: usize) -> Option<Vec<u8>> {
+        let start = usize::try_from(off).ok()?;
+        if let Some(b) = start.checked_add(len).and_then(|end| self.head.get(start..end)) {
             return Some(b.to_vec());
         }
-        self.f.seek(SeekFrom::Start(off)).ok()?;
+        let f = self.f.as_mut()?;
+        f.seek(SeekFrom::Start(off)).ok()?;
         let mut b = vec![0; len];
-        self.f.read_exact(&mut b).ok()?;
+        f.read_exact(&mut b).ok()?;
         Some(b)
     }
-    fn u16(&self, b: &[u8]) -> u16 {
+    /// Grow the cached start of the file to `len` bytes (or EOF) with one read.
+    pub(crate) fn extend_head(&mut self, len: usize) {
+        let have = self.head.len();
+        let Some(f) = self.f.as_mut().filter(|_| len > have) else { return };
+        if f.seek(SeekFrom::Start(have as u64)).is_ok() {
+            let _ = f.by_ref().take((len - have) as u64).read_to_end(&mut self.head);
+        }
+    }
+    /// Check the "II*\0" / "MM\0*" header, set the byte order and return IFD0's offset.
+    pub(crate) fn header(&mut self) -> Option<u64> {
+        let hdr = self.bytes(0, 8)?;
+        self.le = match &hdr[..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        (self.u16(&hdr[2..4]) == 42).then(|| self.u32(&hdr[4..8]) as u64)
+    }
+    pub(crate) fn u16(&self, b: &[u8]) -> u16 {
         let a = [b[0], b[1]];
         if self.le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
     }
-    fn u32(&self, b: &[u8]) -> u32 {
+    pub(crate) fn u32(&self, b: &[u8]) -> u32 {
         let a = [b[0], b[1], b[2], b[3]];
         if self.le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
     }
     /// Width x height from a JPEG's SOF header, walking marker segments from `off`.
-    fn jpeg_dims(&mut self, off: u64) -> Option<(u32, u32)> {
+    pub(crate) fn jpeg_dims(&mut self, off: u64) -> Option<(u32, u32)> {
         if self.bytes(off, 2)? != [0xFF, 0xD8] {
             return None;
         }
@@ -188,30 +217,42 @@ impl Tiff {
     }
 }
 
-pub fn read(path: &Path, pick: Pick) -> Option<RawMeta> {
-    let mut f = File::open(path).ok()?;
-    let mut head = Vec::with_capacity(HEAD);
-    (&mut f).take(HEAD as u64).read_to_end(&mut head).ok()?;
-    let mut t = Tiff { f, head, le: true };
-    let hdr = t.bytes(0, 8)?;
-    t.le = match &hdr[..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return None,
-    };
-    if t.u16(&hdr[2..4]) != 42 {
-        return None;
-    }
+/// What an IFD walk collects. Shared by the ARW reader and the CR3 reader (whose
+/// IFD0 and Exif IFD sit in separate TIFF blocks, walked one after the other).
+#[derive(Default)]
+pub(crate) struct Walk {
+    /// Embedded JPEGs as (offset, length).
+    previews: Vec<(u64, u64)>,
+    date_orig: Option<String>,
+    date: Option<String>,
+    orientation: Option<u16>,
+    pub(crate) exif: Exif,
+    iso: Option<u32>,
+    rec_exposure_index: Option<u32>,
+    makernote: Option<u64>,
+    /// IFD0 Rating (0x4746).
+    pub(crate) rating: Option<u16>,
+}
 
-    let mut queue = vec![t.u32(&hdr[4..8]) as u64];
+impl Walk {
+    pub(crate) fn finish(mut self, preview: Option<Vec<u8>>) -> RawMeta {
+        // ISO is a SHORT, so high ISOs are stored as 65535 with the real value elsewhere.
+        self.exif.iso = match self.iso {
+            Some(65535) | None => self.rec_exposure_index.or(self.iso),
+            i => i,
+        };
+        RawMeta { preview, date: self.date_orig.or(self.date), orientation: self.orientation.unwrap_or(1), exif: self.exif }
+    }
+}
+
+/// Walk the IFD at `start`; `ifd0` says it's the main image's IFD (make, model,
+/// orientation). With `chain`, also follow the next-IFD, Exif and SubIFD pointers
+/// (a whole TIFF/ARW); without, read just this one IFD (a CR3 CMT block).
+pub(crate) fn walk(t: &mut Tiff, start: u64, ifd0: bool, chain: bool, st: &mut Walk) {
+    let mut queue = vec![start];
     let mut seen = HashSet::new();
-    let mut previews: Vec<(u64, u64)> = Vec::new();
-    let (mut date_orig, mut date) = (None, None);
-    let mut orientation = 1;
-    let mut first = true;
-    let mut exif = Exif::default();
-    let (mut iso, mut rec_exposure_index) = (None, None);
-    let mut makernote = None;
+    let mut first = ifd0;
+    let exif = &mut st.exif;
 
     while let Some(off) = queue.pop() {
         if off == 0 || seen.len() > 64 || !seen.insert(off) {
@@ -234,9 +275,10 @@ pub fn read(path: &Path, pick: Pick) -> Option<RawMeta> {
             match tag {
                 0x0201 => jpg_off = val as u64,
                 0x0202 => jpg_len = val as u64,
-                0x0112 if first => orientation = val as u16,
-                0x0132 if date.is_none() => date = t.date(val as u64, count),
-                0x9003 if date_orig.is_none() => date_orig = t.date(val as u64, count),
+                0x0112 if first => st.orientation = Some(val as u16),
+                0x4746 if first => st.rating = Some(val as u16),
+                0x0132 if st.date.is_none() => st.date = t.date(val as u64, count),
+                0x9003 if st.date_orig.is_none() => st.date_orig = t.date(val as u64, count),
                 0x010F if first => exif.make = t.text(e, count),
                 0x0110 if first => exif.model = t.text(e, count),
                 0xA434 => exif.lens = t.text(e, count),
@@ -249,13 +291,13 @@ pub fn read(path: &Path, pick: Pick) -> Option<RawMeta> {
                 0x920A => exif.focal = t.rational(val as u64, false),
                 0x9204 => exif.bias = t.rational(val as u64, true),
                 0xA405 if val > 0 => exif.focal35 = Some(val),
-                0x8827 => iso = Some(val),
-                0x8832 => rec_exposure_index = Some(val),
+                0x8827 => st.iso = Some(val),
+                0x8832 => st.rec_exposure_index = Some(val),
                 0x0100 => w = val,
                 0x0101 => h = val,
-                0x8769 => queue.push(val as u64), // Exif IFD
-                0x927C => makernote = Some(val as u64),
-                0x014A => {
+                0x8769 if chain => queue.push(val as u64), // Exif IFD
+                0x927C => st.makernote = Some(val as u64),
+                0x014A if chain => {
                     // SubIFDs
                     if count == 1 {
                         queue.push(val as u64);
@@ -272,35 +314,56 @@ pub fn read(path: &Path, pick: Pick) -> Option<RawMeta> {
             (exif.width, exif.height) = (w, h);
         }
         if jpg_off > 0 && jpg_len > 0 {
-            previews.push((jpg_off, jpg_len));
+            st.previews.push((jpg_off, jpg_len));
         }
-        queue.push(t.u32(&block[n * 12..]) as u64); // next IFD in chain
+        if chain {
+            queue.push(t.u32(&block[n * 12..]) as u64); // next IFD in chain
+        }
         first = false;
     }
+}
 
-    if let Some(off) = makernote {
-        sony_makernote(&mut t, off, &mut exif);
-    }
+/// Embedded JPEGs claiming to be bigger than this are a corrupt length, not a JPEG.
+pub(crate) const MAX_JPEG: u64 = 64 << 20;
 
-    let mut jpegs: Vec<(u64, u64, u32)> = previews
-        .into_iter()
-        .filter(|&(_, len)| len < 64 << 20)
-        .filter_map(|(off, len)| Some((off, len, t.jpeg_dims(off)?.0)))
-        .collect();
+/// Choose among embedded JPEGs, given as (offset, length, width) and already
+/// filtered to MAX_JPEG: the screen-sized preview or the full-resolution one.
+/// Returns the chosen (offset, length), and whether a full-resolution JPEG
+/// exists at all (for `Exif::full_jpeg`).
+pub(crate) fn pick_jpeg(mut jpegs: Vec<(u64, u64, u32)>, pick: Pick) -> (Option<(u64, u64)>, bool) {
     jpegs.sort_by_key(|&(_, _, w)| w);
-    exif.full_jpeg = jpegs.last().is_some_and(|j| j.2 >= 3000);
+    let full = jpegs.last().is_some_and(|j| j.2 >= 3000);
     let chosen = match pick {
         Pick::Preview => jpegs.iter().find(|j| j.2 >= 1200).or(jpegs.last()),
         Pick::FullSize => jpegs.last().filter(|j| j.2 >= 3000),
     };
-    let preview = chosen.and_then(|&(off, len, _)| t.bytes(off, len as usize));
+    (chosen.map(|&(off, len, _)| (off, len)), full)
+}
 
-    // ISO is a SHORT, so high ISOs are stored as 65535 with the real value elsewhere.
-    exif.iso = match iso {
-        Some(65535) | None => rec_exposure_index.or(iso),
-        i => i,
-    };
-    Some(RawMeta { preview, date: date_orig.or(date), orientation, exif })
+pub fn read(path: &Path, pick: Pick) -> Option<RawMeta> {
+    let mut f = File::open(path).ok()?;
+    let mut head = Vec::with_capacity(HEAD);
+    (&mut f).take(HEAD as u64).read_to_end(&mut head).ok()?;
+    let mut t = Tiff { f: Some(f), head, le: true };
+    if t.head.get(4..8) == Some(b"ftyp") {
+        return crate::cr3::read(&mut t, pick);
+    }
+    let ifd0 = t.header()?;
+
+    let mut st = Walk::default();
+    walk(&mut t, ifd0, true, true, &mut st);
+    if let Some(off) = st.makernote {
+        sony_makernote(&mut t, off, &mut st.exif);
+    }
+    let jpegs: Vec<(u64, u64, u32)> = std::mem::take(&mut st.previews)
+        .into_iter()
+        .filter(|&(_, len)| len < MAX_JPEG)
+        .filter_map(|(off, len)| Some((off, len, t.jpeg_dims(off)?.0)))
+        .collect();
+    let (chosen, full) = pick_jpeg(jpegs, pick);
+    st.exif.full_jpeg = full;
+    let preview = chosen.and_then(|(off, len)| t.bytes(off, len as usize));
+    Some(st.finish(preview))
 }
 
 /// Sony's MakerNote is a plain IFD (optionally behind a "SONY DSC "/"SONY CAM "
@@ -336,4 +399,46 @@ fn sony_makernote(t: &mut Tiff, off: u64, exif: &mut Exif) -> Option<()> {
         });
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Not a real test: a debug dump of what's read from a folder of RAWs (any
+    /// format). Ignored so it doesn't pose as a passing test; run it with
+    /// `SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test --release samples -- --ignored --nocapture`
+    #[test]
+    #[ignore = "debug dump; needs SLOPSHOT_SAMPLES"]
+    fn samples() {
+        let dir = std::env::var_os("SLOPSHOT_SAMPLES").expect("set SLOPSHOT_SAMPLES to a folder of RAWs");
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths.iter().filter(|p| p.is_file()) {
+            for pick in [Pick::Preview, Pick::FullSize] {
+                let Some(m) = read(p, pick) else {
+                    println!("{}: not readable", p.display());
+                    break;
+                };
+                let e = &m.exif;
+                let dims = m.preview.as_deref().and_then(|j| image::load_from_memory(j).ok()).map(|i| (i.width(), i.height()));
+                println!(
+                    "{} {}: jpeg {:?} bytes, decoded {:?} | {:?} {:?} | {} | {}x{} orient {} full_jpeg {} rating {:?} focus {:?}",
+                    p.file_name().unwrap().to_string_lossy(),
+                    if pick == Pick::Preview { "preview" } else { "full" },
+                    m.preview.as_ref().map(Vec::len),
+                    dims,
+                    m.date,
+                    e.camera(),
+                    e.summary(),
+                    e.width,
+                    e.height,
+                    m.orientation,
+                    e.full_jpeg,
+                    e.rating,
+                    e.focus.map(|f| (f.sensor, f.at, f.frame)),
+                );
+            }
+        }
+    }
 }
